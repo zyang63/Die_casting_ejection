@@ -1,0 +1,412 @@
+import subprocess
+import sys
+import os
+import bpy
+import math
+import numpy as np
+
+# Make sure that pip is available
+subprocess.check_call([sys.executable, "-m", "ensurepip", "--default-pip"])
+
+# Install Pillow
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "Pillow"])
+
+from PIL import Image, ImageDraw
+
+filename = "D:/PhD Work/Demo geometry/Casting_Shot - 8M0111257-1.STL"
+meshes_file_path = "D:/PhD Work/text_blender/remeshed_uv.obj"
+abs_F_image_file_path = "D:/PhD Work/text_blender/marked_image_abs_F.png"
+abs_F_glb_file_path = "D:/PhD Work/text_blender/marked_image_abs_F.glb"
+abs_tangent_image_file_path = "D:/PhD Work/text_blender/marked_image_abs_tangent.png"
+abs_tangent_glb_file_path = "D:/PhD Work/text_blender/marked_image_abs_tangent.glb"
+tangent_image_file_path = "D:/PhD Work/text_blender/marked_image_tangent.png"
+tangent_glb_file_path = "D:/PhD Work/text_blender/marked_image_tangent.glb"
+
+#'x': [0.0, 0.0, 1.0],'y': [1.0, 0.0, 0.0] ,'z': [0.0, 1.0, 0.0]
+F_direction = [0.0, 1.0, 0.0]
+
+voxel_size = 1
+Mu = 0.6
+Max_scale_value = 0.05
+
+# Delete all objects
+bpy.ops.object.select_all(action='DESELECT')
+bpy.ops.object.select_all(action='SELECT')
+bpy.ops.object.delete()
+
+# Import STL mesh and apply remesh modifier
+bpy.ops.import_mesh.stl(filepath= filename, global_scale=0.1,)
+
+bpy.ops.object.modifier_add(type='REMESH')
+bpy.context.object.modifiers["Remesh"].mode = 'VOXEL'
+bpy.context.object.modifiers["Remesh"].voxel_size = voxel_size/10
+bpy.ops.object.modifier_apply(modifier="Remesh")
+
+# Unwrap the mesh using Smart UV Project
+bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.mesh.select_all(action='SELECT')
+bpy.ops.uv.smart_project()
+bpy.ops.object.mode_set(mode='OBJECT')
+selected_object = bpy.context.object
+
+# Export the object as an OBJ file
+for obj in bpy.context.selected_objects:
+    if obj.type == "MESH":
+        bpy.ops.export_scene.obj(filepath=meshes_file_path, use_triangles=False, use_materials=False)
+
+# Replace 'your_obj_file.obj' with the actual file path.
+obj_file_path = meshes_file_path
+
+# Initialize lists to store vertices, faces, cosines, and VT coordinates.
+vertices = []
+faces = []
+cosines = []
+sines = []
+vt_coordinates = []
+vt_faces = []
+abs_F_list = []
+tangents = []
+abs_tangents = []
+# Read the OBJ file and extract vertices, faces, cosines, and VT coordinates.
+with open(obj_file_path, 'r') as obj_file:
+    for line in obj_file:
+        if line.startswith('v '):
+            vertex = list(map(float, line.split()[1:]))
+            if len(vertex) == 2:  # Check for 2D vertices and add a 'z' component
+                vertex.append(0.0)
+            vertices.append(vertex)
+        elif line.startswith('f '):
+            elements = line.split()[1:]
+            face = []
+            vt_face = []
+            for element in elements:
+                vertex_indices = element.split('/')
+                v_index = int(vertex_indices[0]) - 1  # Vertex index
+                vt_index = int(vertex_indices[1]) - 1  # Vertex index
+                face.append(v_index)
+                vt_face.append(vt_index)
+            faces.append(face)
+            vt_faces.append(vt_face)
+            #print(vt_face)
+        elif line.startswith('vt '):
+            vt = list(map(float, line.split()[1:]))
+            vt_coordinates.append(vt)
+# Calculate normal vectors for each face.
+normal_vectors = []
+for face in faces:
+    if all(0 <= i < len(vertices) for i in face):  # Check that all vertex indices are valid.
+        v0 = np.array(vertices[face[0]])
+        v1 = np.array(vertices[face[1]])
+        v2 = np.array(vertices[face[2]])
+
+        edge1 = v1 - v0
+        edge2 = v2 - v0
+
+        normal = np.cross(edge1, edge2)
+        normal /= np.linalg.norm(normal)
+        normal_vectors.append(normal)
+
+        direction = np.array(F_direction)
+        dot_product = np.dot(normal, direction)
+
+        # Calculate the Euclidean norms of A and B
+        norm_A = np.linalg.norm(normal)
+        norm_B = np.linalg.norm(direction)
+
+        # Calculate the cosine similarity
+        cosine = dot_product / (norm_A * norm_B)
+        sine = np.sqrt(1 - cosine**2)
+        abs_F = 0.6*abs(sine) - abs(cosine)
+        tangent =  cosine / sine
+        abs_F_list.append(abs_F)
+        cosines.append(cosine)
+        sines.append(sine)
+        tangents.append(tangent)
+        abs_tangents.append(abs(tangent))
+        
+cosines_array = np.array(cosines)
+abs_F_array = np.array(abs_F_list)
+max_abs_F = abs_F_array.max()
+min_abs_F = abs_F_array.min()
+tangents_array = np.array(tangents)
+tangent_filtered_array = tangents_array[~np.isnan(tangents_array) & np.isfinite(tangents_array)]
+abs_tangents_array = np.array(abs_tangents)
+abs_tangent_filtered_array = abs_tangents_array[~np.isnan(abs_tangents_array) & np.isfinite(abs_tangents_array)]
+
+
+# Determine the image size.
+image_size = 1080
+
+color_bins = [(i, 0, 256-i) for i in range(0, 256, 26)]
+
+# Create a black image.
+image = Image.new("RGB", (image_size, image_size), "black")
+draw = ImageDraw.Draw(image)
+
+# Scale the VT coordinates to fit the 1080x1080 image size.
+scaled_vt_coordinates = [
+    (vt[0] * image_size, (1 - vt[1]) * image_size) for vt in vt_coordinates
+]
+
+# Loop through the faces and apply red or blue coloring based on cosines.
+for i, (vt_face, abs_F) in enumerate(zip(vt_faces, abs_F_list)):
+    if all(0 <= j < len(scaled_vt_coordinates) for j in vt_face):
+        vt_indices = [scaled_vt_coordinates[j] for j in vt_face]
+        #print(vt_indices)
+        fraction = (abs_F - min_abs_F) / (max_abs_F - min_abs_F)
+        index = int(fraction * 10)
+        index = max(0, min(index, 9))  # Ensure the index is within the valid range
+
+    # Use the selected color from the color_bins list
+        color = color_bins[index]
+        draw.polygon(
+            vt_indices,
+            outline=color,
+            fill=color,
+        )
+
+# Save the marked image.
+image.save(abs_F_image_file_path)
+
+material = bpy.data.materials.new(name="MyMaterial_1")
+
+# Create a new shader node tree for the material
+material.use_nodes = True
+tree = material.node_tree
+nodes = tree.nodes
+
+# Clear existing nodes
+for node in nodes:
+    nodes.remove(node)
+
+# Create a new Principled BSDF node
+bsdf_node = nodes.new(type='ShaderNodeBsdfPrincipled')
+bsdf_node.location = (0, 0)  # Position the node in the node editor
+
+# Create a new Image Texture node
+texture_node = nodes.new(type='ShaderNodeTexImage')
+texture_node.location = (-200, 0)  # Position the node in the node editor
+
+# Set the path to the image texture
+texture_node.image = bpy.data.images.load(abs_F_image_file_path)
+
+# Connect the Image Texture node to the Base Color input of the Principled BSDF node
+base_color_link = tree.links.new(texture_node.outputs['Color'], bsdf_node.inputs['Base Color'])
+
+# Create a new Material Output node
+output_node = nodes.new(type='ShaderNodeOutputMaterial')
+output_node.location = (200, 0)  # Position the node in the node editor
+
+# Connect the Principled BSDF node to the Surface input of the Material Output node
+surface_link = tree.links.new(bsdf_node.outputs['BSDF'], output_node.inputs['Surface'])
+
+# Assign the material to the active object
+bpy.context.object.data.materials.append(material)
+bpy.ops.export_scene.gltf(filepath=abs_F_glb_file_path)
+
+
+
+# Determine the image size.
+image_size = 1080
+
+color_bins = [(256-i, 0, i) for i in range(0, 256, 26)]
+
+# Create a black image.
+image = Image.new("RGB", (image_size, image_size), "black")
+draw = ImageDraw.Draw(image)
+
+# Scale the VT coordinates to fit the 1080x1080 image size.
+scaled_vt_coordinates = [
+    (vt[0] * image_size, (1 - vt[1]) * image_size) for vt in vt_coordinates
+]
+
+# Loop through the faces and apply red or blue coloring based on cosines.
+for i, (vt_face, abs_tangent) in enumerate(zip(vt_faces ,abs_tangents)):
+    if all(0 <= j < len(scaled_vt_coordinates) for j in vt_face):
+        vt_indices = [scaled_vt_coordinates[j] for j in vt_face]
+        if abs_tangent != float('inf') and 0 <= abs_tangent <= Max_scale_value:
+          fraction = (abs_tangent - 0) / Max_scale_value
+
+    # Map fraction to one of the 10 color bins
+          index = int(fraction * 10)
+          index = max(0, min(index, 9))  # Ensure the index is within the valid range
+
+    # Use the selected color from the color_bins list
+          color = color_bins[index]
+        elif abs_tangent != float('inf') and  abs_tangent > Mu:
+            color = (125, 125, 125)
+        elif abs_tangent != float('inf') and  Max_scale_value < abs_tangent <= Mu:
+            color = (0, 0, 255)
+        elif abs_tangent == float('inf'):
+            color = (125, 125, 125)
+        # Draw a red or blue polygon on the image.
+        draw.polygon(
+            vt_indices,
+            outline=color,
+            fill=color,
+        )
+
+# Save the marked image.
+image.save(abs_tangent_image_file_path)
+
+# Create a new material
+material = bpy.data.materials.new(name="MyMaterial_2")
+
+# Create a new shader node tree for the material
+material.use_nodes = True
+tree = material.node_tree
+nodes = tree.nodes
+
+# Clear existing nodes
+for node in nodes:
+    nodes.remove(node)
+
+# Create a new Principled BSDF node
+bsdf_node = nodes.new(type='ShaderNodeBsdfPrincipled')
+bsdf_node.location = (0, 0)  # Position the node in the node editor
+
+# Create a new Image Texture node
+texture_node = nodes.new(type='ShaderNodeTexImage')
+texture_node.location = (-200, 0)  # Position the node in the node editor
+
+# Set the path to the image texture
+texture_node.image = bpy.data.images.load(abs_tangent_image_file_path)
+
+# Connect the Image Texture node to the Base Color input of the Principled BSDF node
+base_color_link = tree.links.new(texture_node.outputs['Color'], bsdf_node.inputs['Base Color'])
+
+# Create a new Material Output node
+output_node = nodes.new(type='ShaderNodeOutputMaterial')
+output_node.location = (200, 0)  # Position the node in the node editor
+
+# Connect the Principled BSDF node to the Surface input of the Material Output node
+surface_link = tree.links.new(bsdf_node.outputs['BSDF'], output_node.inputs['Surface'])
+
+# Get the active object
+obj = bpy.context.active_object
+if obj:
+    # Check if the object already has materials
+    if obj.data.materials:
+        # Assign the new material to the first material slot
+        obj.data.materials[0] = material
+    else:
+        # If there are no materials, append the new material
+        obj.data.materials.append(material)
+
+    # Update the scene
+    bpy.context.view_layer.update()
+
+    # Export to GLTF
+    bpy.ops.export_scene.gltf(filepath=abs_tangent_glb_file_path)
+
+
+# Determine the image size.
+image_size = 1080
+
+color_bins_positive = [(256-i, 0, 0) for i in range(0, 256, 26)]
+color_bins_negative = [(0, 0, 256-i) for i in range(0, 256, 26)]
+
+# Create a black image.
+image = Image.new("RGB", (image_size, image_size), "black")
+draw = ImageDraw.Draw(image)
+
+# Scale the VT coordinates to fit the 1080x1080 image size.
+scaled_vt_coordinates = [
+    (vt[0] * image_size, (1 - vt[1]) * image_size) for vt in vt_coordinates
+]
+
+# Loop through the faces and apply red or blue coloring based on cosines.
+for i, (vt_face, tangent) in enumerate(zip(vt_faces ,tangents)):
+    if all(0 <= j < len(scaled_vt_coordinates) for j in vt_face):
+        vt_indices = [scaled_vt_coordinates[j] for j in vt_face]
+        if tangent != float('inf') and 0 < tangent <= Max_scale_value:
+          fraction = (tangent - 0) / Max_scale_value
+
+    # Map fraction to one of the 10 color bins
+          index = int(fraction * 10)
+          index = max(0, min(index, 9))  # Ensure the index is within the valid range
+
+    # Use the selected color from the color_bins list
+          color = color_bins_positive[index]
+        elif tangent != float('inf') and (-Max_scale_value) <= tangent < 0:
+          fraction = (tangent -0) / (-Max_scale_value)
+
+    # Map fraction to one of the 10 color bins
+          index_1 = int(fraction * 10)
+          index_1 = max(0, min(index, 9))  # Ensure the index is within the valid range
+          color = color_bins_negative[index]
+        elif tangent != float('inf') and  tangent > Mu:
+            color = (125, 125, 125)
+        elif tangent != float('inf') and  tangent < (-Mu):
+            color = (125, 125, 125)
+        elif tangent != float('inf') and  Max_scale_value < tangent <= Mu:
+            color = (255, 0, 0)
+        elif tangent != float('inf') and  (-Mu) <= tangent < (-Max_scale_value):
+            color = (0, 0, 255)
+        elif tangent == 0:
+            color = (255, 255, 255)
+        elif tangent == float('inf'):
+            color = (125, 125, 125)
+        # Draw a red or blue polygon on the image.
+        draw.polygon(
+            vt_indices,
+            outline=color,
+            fill=color,
+        )
+
+# Save the marked image.
+image.save(tangent_image_file_path)
+
+# Create a new material
+material = bpy.data.materials.new(name="MyMaterial_3")
+
+# Create a new shader node tree for the material
+material.use_nodes = True
+tree = material.node_tree
+nodes = tree.nodes
+
+# Clear existing nodes
+for node in nodes:
+    nodes.remove(node)
+
+# Create a new Principled BSDF node
+bsdf_node = nodes.new(type='ShaderNodeBsdfPrincipled')
+bsdf_node.location = (0, 0)  # Position the node in the node editor
+
+# Create a new Image Texture node
+texture_node = nodes.new(type='ShaderNodeTexImage')
+texture_node.location = (-200, 0)  # Position the node in the node editor
+
+# Set the path to the image texture
+texture_node.image = bpy.data.images.load(tangent_image_file_path)
+
+# Connect the Image Texture node to the Base Color input of the Principled BSDF node
+base_color_link = tree.links.new(texture_node.outputs['Color'], bsdf_node.inputs['Base Color'])
+
+# Create a new Material Output node
+output_node = nodes.new(type='ShaderNodeOutputMaterial')
+output_node.location = (200, 0)  # Position the node in the node editor
+
+# Connect the Principled BSDF node to the Surface input of the Material Output node
+surface_link = tree.links.new(bsdf_node.outputs['BSDF'], output_node.inputs['Surface'])
+
+# Get the active object
+obj = bpy.context.active_object
+if obj:
+    # Check if the object already has materials
+    if obj.data.materials:
+        # Assign the new material to the first material slot
+        obj.data.materials[0] = material
+    else:
+        # If there are no materials, append the new material
+        obj.data.materials.append(material)
+
+    # Update the scene
+    bpy.context.view_layer.update()
+
+    # Export to GLTF
+    bpy.ops.export_scene.gltf(filepath=tangent_glb_file_path)
+
+
+
+
